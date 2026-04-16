@@ -32,6 +32,9 @@ typedef struct
     char data[CHANNEL_SIZE];
 } Channel;
 
+// Otwiera kanał w shared memory, inicjalizuje go tylko przy pierwszym utworzeniu.
+// shm_open tworzy lub otwiera obiekt, ftruncate ustawia jego rozmiar, a mmap daje
+// zwykły wskaźnik do pamięci współdzielonej widocznej dla wszystkich procesów.
 Channel* channel_open(const char* name)
 {
     int fd;
@@ -41,6 +44,7 @@ Channel* channel_open(const char* name)
 
     snprintf(sem_name, sizeof(sem_name), "/init_%s", name);
 
+    // Named semaphore blokuje wyścig między procesami otwierającymi kanał.
     init_sem = sem_open(sem_name, O_CREAT, 0666, 1);
     if (init_sem == SEM_FAILED)
         ERR("sem_open");
@@ -51,9 +55,11 @@ Channel* channel_open(const char* name)
     if (fd == -1)
         ERR("shm_open");
 
+    // Shared memory musi mieć dokładnie rozmiar struktury kanału.
     if (ftruncate(fd, sizeof(Channel)) == -1)
         ERR("ftruncate");
 
+    // mmap mapuje cały kanał do przestrzeni adresowej procesu.
     ch = (Channel*)mmap(NULL, sizeof(Channel), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (ch == MAP_FAILED)
         ERR("mmap");
@@ -66,6 +72,7 @@ Channel* channel_open(const char* name)
         pthread_mutexattr_t mattr;
         pthread_condattr_t cattr;
 
+        // Mutex i condition variable muszą działać między procesami.
         if (pthread_mutexattr_init(&mattr))
             ERR("pthread_mutexattr_init");
         if (pthread_mutexattr_setpshared(&mattr, PTHREAD_PROCESS_SHARED))
@@ -89,12 +96,14 @@ Channel* channel_open(const char* name)
         ch->status = CHANNEL_EMPTY;
     }
 
+    // Zwalniamy blokadę inicjalizacji dla kolejnych procesów.
     sem_post(init_sem);
     sem_close(init_sem);
 
     return ch;
 }
 
+// Zamyka lokalne mapowanie kanału.
 int channel_close(const char* name, Channel* ch)
 {
     if (munmap(ch, sizeof(Channel)))
@@ -103,10 +112,13 @@ int channel_close(const char* name, Channel* ch)
     return 0;
 }
 
+// Czeka aż w kanale pojawią się dane, kopiuje je do bufora i zwalnia miejsce
+// dla producenta. Gdy kanał jest depleted, zwraca 1.
 int channel_consume(Channel* ch, char* buffer)
 {
     pthread_mutex_lock(&ch->mutex);
 
+    // Konsument zasypia, dopóki producent nie wstawi danych.
     while (ch->status == CHANNEL_EMPTY)
         pthread_cond_wait(&ch->consumer_cv, &ch->mutex);
 
@@ -116,6 +128,7 @@ int channel_consume(Channel* ch, char* buffer)
         return 1;
     }
 
+    // Po odczycie oznaczamy kanał jako pusty i budzimy producenta.
     strcpy(buffer, ch->data);
     ch->status = CHANNEL_EMPTY;
     pthread_cond_signal(&ch->producer_cv);
@@ -124,10 +137,12 @@ int channel_consume(Channel* ch, char* buffer)
     return 0;
 }
 
+// Wkłada tekst do kanału. Jeśli kanał jest zajęty, producent czeka.
 void channel_produce(Channel* ch, const char* buffer)
 {
     pthread_mutex_lock(&ch->mutex);
 
+    // Producent nie nadpisuje danych, dopóki konsument ich nie zabierze.
     while (ch->status == CHANNEL_OCCUPIED)
         pthread_cond_wait(&ch->producer_cv, &ch->mutex);
 
@@ -142,6 +157,7 @@ void channel_produce(Channel* ch, const char* buffer)
     pthread_mutex_unlock(&ch->mutex);
 }
 
+// Oznacza kanał jako pusty na zawsze i budzi wszystkie czekające procesy.
 void channel_mark_depleted(Channel* ch)
 {
     pthread_mutex_lock(&ch->mutex);
@@ -149,6 +165,7 @@ void channel_mark_depleted(Channel* ch)
     while (ch->status == CHANNEL_OCCUPIED)
         pthread_cond_wait(&ch->producer_cv, &ch->mutex);
 
+    // Po zakończeniu wejścia dalsze consume mają wiedzieć, że nic już nie będzie.
     ch->status = CHANNEL_DEPLETED;
     pthread_cond_broadcast(&ch->consumer_cv);
 
@@ -174,9 +191,11 @@ int main(int argc, char* argv[])
 
     while (1)
     {
+        // Odbiór z kanału wejściowego blokuje się, gdy nie ma jeszcze danych.
         if (channel_consume(input_ch, buffer))
             break;
 
+        // To jest etap pośredni: pokazujemy wejście i budujemy zduplikowany tekst.
         printf("%s\n", buffer);
         fflush(stdout);
 
@@ -184,6 +203,7 @@ int main(int argc, char* argv[])
         char* dst = output_buffer;
         size_t dstlen = 0;
 
+        // Każdy znak z wejścia trafia dwa razy do bufora wyjściowego.
         while (*src && dstlen < CHANNEL_SIZE - 1)
         {
             *dst++ = *src;
@@ -197,6 +217,7 @@ int main(int argc, char* argv[])
         }
         *dst = '\0';
 
+        // Jeśli duplikacja nie mieści się w jednym komunikacie, dzielimy ją na części.
         if (dstlen > CHANNEL_SIZE - 1)
         {
             char part1[CHANNEL_SIZE];

@@ -28,6 +28,8 @@ typedef struct
     char data[CHANNEL_SIZE];
 } Channel;
 
+// Otwiera wspólny kanał w shared memory i inicjalizuje go tylko raz.
+// shm_open, ftruncate i mmap przygotowują obiekt widoczny dla wszystkich procesów.
 Channel* channel_open(const char* name)
 {
     int fd;
@@ -37,6 +39,7 @@ Channel* channel_open(const char* name)
 
     snprintf(sem_name, sizeof(sem_name), "/init_%s", name);
 
+    // Semaphore chroni inicjalizację kanału przed równoczesnym startem kilku procesów.
     init_sem = sem_open(sem_name, O_CREAT, 0666, 1);
     if (init_sem == SEM_FAILED)
     {
@@ -53,12 +56,14 @@ Channel* channel_open(const char* name)
         exit(EXIT_FAILURE);
     }
 
+    // Ustawiamy pełny rozmiar obiektu shared memory.
     if (ftruncate(fd, sizeof(Channel)) == -1)
     {
         perror("ftruncate");
         exit(EXIT_FAILURE);
     }
 
+    // Po mmap kanał zachowuje się jak zwykła struktura w pamięci procesu.
     ch = (Channel*)mmap(NULL, sizeof(Channel), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (ch == MAP_FAILED)
     {
@@ -77,6 +82,7 @@ Channel* channel_open(const char* name)
         pthread_mutexattr_t mattr;
         pthread_condattr_t cattr;
 
+        // Mutex i condition variable muszą być współdzielone między procesami.
         if (pthread_mutexattr_init(&mattr))
             exit(EXIT_FAILURE);
         if (pthread_mutexattr_setpshared(&mattr, PTHREAD_PROCESS_SHARED))
@@ -100,16 +106,19 @@ Channel* channel_open(const char* name)
         ch->status = CHANNEL_EMPTY;
     }
 
+    // Kończymy blokadę startową dla kolejnych procesów.
     sem_post(init_sem);
     sem_close(init_sem);
 
     return ch;
 }
 
+// Konsument czeka na dane, kopiuje je do bufora i zwalnia miejsce dla producenta.
 int channel_consume(Channel* ch, char* buffer)
 {
     pthread_mutex_lock(&ch->mutex);
 
+    // Jeśli kanał jest pusty, konsumenci śpią do czasu signal z producenta.
     while (ch->status == CHANNEL_EMPTY)
         pthread_cond_wait(&ch->consumer_cv, &ch->mutex);
 
@@ -119,6 +128,7 @@ int channel_consume(Channel* ch, char* buffer)
         return 1;
     }
 
+    // Po odczycie kanał znów staje się pusty.
     strcpy(buffer, ch->data);
     ch->status = CHANNEL_EMPTY;
     pthread_cond_signal(&ch->producer_cv);
@@ -137,6 +147,7 @@ int main(int argc, char* argv[])
 
     const char* channel_name = argv[1];
 
+    // Printer tylko odbiera i wypisuje komunikaty na standardowe wyjście.
     Channel* ch = channel_open(channel_name);
 
     char buffer[CHANNEL_SIZE];

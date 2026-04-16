@@ -28,6 +28,9 @@ typedef struct
     char data[CHANNEL_SIZE];
 } Channel;
 
+// Otwiera kanał w shared memory i inicjalizuje go tylko przy pierwszym użyciu.
+// shm_open tworzy lub otwiera obiekt, ftruncate ustawia jego rozmiar, a mmap
+// mapuje go do pamięci procesu.
 Channel* channel_open(const char* name)
 {
     int fd;
@@ -37,6 +40,7 @@ Channel* channel_open(const char* name)
 
     snprintf(sem_name, sizeof(sem_name), "/init_%s", name);
 
+    // Named semaphore zabezpiecza inicjalizację przed wyścigiem wielu procesów.
     init_sem = sem_open(sem_name, O_CREAT, 0666, 1);
     if (init_sem == SEM_FAILED)
     {
@@ -53,12 +57,14 @@ Channel* channel_open(const char* name)
         exit(EXIT_FAILURE);
     }
 
+    // Shared memory musi mieć rozmiar całej struktury kanału.
     if (ftruncate(fd, sizeof(Channel)) == -1)
     {
         perror("ftruncate");
         exit(EXIT_FAILURE);
     }
 
+    // Po mmap kanał zachowuje się jak zwykła struktura w RAM.
     ch = (Channel*)mmap(NULL, sizeof(Channel), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (ch == MAP_FAILED)
     {
@@ -77,6 +83,7 @@ Channel* channel_open(const char* name)
         pthread_mutexattr_t mattr;
         pthread_condattr_t cattr;
 
+        // Mutex i condition variable muszą być współdzielone między procesami.
         if (pthread_mutexattr_init(&mattr))
             exit(EXIT_FAILURE);
         if (pthread_mutexattr_setpshared(&mattr, PTHREAD_PROCESS_SHARED))
@@ -100,16 +107,19 @@ Channel* channel_open(const char* name)
         ch->status = CHANNEL_EMPTY;
     }
 
+    // Kończymy blokadę startową dla kolejnych procesów.
     sem_post(init_sem);
     sem_close(init_sem);
 
     return ch;
 }
 
+// Producent czeka aż kanał będzie pusty, po czym zapisuje nowy tekst.
 void channel_produce(Channel* ch, const char* buffer)
 {
     pthread_mutex_lock(&ch->mutex);
 
+    // Nie wolno nadpisać danych, dopóki konsument ich nie zabierze.
     while (ch->status == CHANNEL_OCCUPIED)
         pthread_cond_wait(&ch->producer_cv, &ch->mutex);
 
@@ -124,6 +134,7 @@ void channel_produce(Channel* ch, const char* buffer)
     pthread_mutex_unlock(&ch->mutex);
 }
 
+// Po zakończeniu wysyłania ostatniego komunikatu oznaczamy kanał jako depleted.
 void channel_mark_depleted(Channel* ch)
 {
     pthread_mutex_lock(&ch->mutex);
@@ -148,6 +159,7 @@ int main(int argc, char* argv[])
     const char* filename = argv[1];
     const char* channel_name = argv[2];
 
+    // Generator czyta plik liniami i wrzuca każdą linię do kanału.
     FILE* file = fopen(filename, "r");
     if (!file)
     {
@@ -160,6 +172,7 @@ int main(int argc, char* argv[])
     char line[CHANNEL_SIZE];
     while (fgets(line, sizeof(line), file))
     {
+        // Usuwamy newline, bo kanał przesyła pojedynczy tekstowy komunikat.
         size_t len = strlen(line);
         if (len > 0 && line[len - 1] == '\n')
             line[len - 1] = '\0';

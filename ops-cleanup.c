@@ -20,11 +20,13 @@ int main(int argc, char* argv[])
         const char* name = argv[i];
         char sem_name[256];
 
+        // Usuwamy obiekt shared memory przypisany do kanału.
         if (shm_unlink(name) == -1)
             perror("shm_unlink");
         else
             printf("Unlinked shared memory: %s\n", name);
 
+        // Usuwamy nazwany semafor używany do inicjalizacji kanału.
         snprintf(sem_name, sizeof(sem_name), "/init_%s", name);
         if (sem_unlink(sem_name) == -1)
             perror("sem_unlink");
